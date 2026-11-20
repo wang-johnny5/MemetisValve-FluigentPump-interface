@@ -1,14 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Multi-pump control web page for Fluigent Flow EZ pumps (1 to 4 pumps).
+"""Pump and valve control web page: Fluigent Flow EZ pumps (1 to 4) plus an Arduino valve box.
 
-Run:   python pump_web.py                 (real pumps, count auto-detected)
-       python pump_web.py --pumps 2       (use exactly 2 pumps)
-       python pump_web.py --sim --pumps 4 (fake pumps, to try the page without hardware)
+Run:   python pump_valve_web.py                 (real hardware, pump count auto-detected)
+       python pump_valve_web.py --pumps 2       (use exactly 2 pumps)
+       python pump_valve_web.py --sim --pumps 2 (fake pumps and a simulated 4-valve box, no hardware needed)
 Then open http://127.0.0.1:8000 (it opens automatically).
 
+Tabs: Manual control (pumps + valves), Task 1 (one pump, two valves), Task 2 (two pumps, four valves).
 Pump 1..4 map to Fluigent pressure channels 0..3 in the order the SDK detects them.
-Every run is logged to pump_logs/ as one CSV with a column pair per pump.
+Every run is logged to pump_logs/: one CSV with pressures and valve states, one with process events.
+Research code: see README.md before using it with real hardware.
 """
 import argparse, csv, io, json, math, os, threading, time, webbrowser
 from datetime import datetime
@@ -17,6 +19,7 @@ from urllib.parse import urlparse, parse_qs
 
 DT = 0.1          # control loop period in seconds (10 Hz)
 MAX_PUMPS = 4
+VERSION = "0.1.0"   # written to the events log so each experiment records which code ran
 
 
 # ---------------------------------------------------------------- hardware
@@ -73,45 +76,53 @@ def _f(key, label, kind, role=None, sign="+", default=10.0):
 TASKS = {
  "t1": dict(title="Task 1: one pump, two valves", roles=["pp"], valves=[1, 2],
   summary="One push-pull pump feeds V1 and V2 through an always-open three-way valve. Each stage holds until you press the next button.",
+  common=[_f("Z_pp", "Rest pressure (the \"zero\")", "p", "pp", "*", 0.0)],
   stages=[
-   dict(title="Stage 1", info="Open V1, ramp to P1",
-        fields=[_f("P1", "P1: positive pressure", "p", "pp", "+", 100.0), _f("r1", "Ramp 0 to P1", "r")],
-        ops=[("open", [1]), ("ramp", {"pp": ("P1", "r1")})]),
+   dict(title="Stage 1", info="Go to rest pressure, open V1, ramp to P1",
+        fields=[_f("P1", "P1: positive pressure", "p", "pp", "+", 100.0), _f("r1", "Ramp rest to P1 (also used to reach rest)", "r")],
+        ops=[("prerest", {"pp": "r1"}), ("open", [1]), ("ramp", {"pp": ("P1", "r1")})]),
    dict(title="Stage 2", info="Ramp to P2",
         fields=[_f("P2", "P2: negative pressure", "p", "pp", "-", -100.0), _f("r2", "Ramp P1 to P2", "r")],
         ops=[("ramp", {"pp": ("P2", "r2")})]),
-   dict(title="Stage 3", info="Ramp to 0, switch V1 to V2, ramp to P3",
-        fields=[_f("r3", "Ramp P2 to 0", "r"), _f("P3", "P3: negative pressure", "p", "pp", "-", -100.0), _f("r4", "Ramp 0 to P3", "r")],
-        ops=[("ramp", {"pp": (0, "r3")}), ("zero", ["pp"]), ("open", [2]), ("ramp", {"pp": ("P3", "r4")})]),
-   dict(title="Stage 4", info="Ramp to 0, close all valves",
-        fields=[_f("r5", "Ramp P3 to 0", "r")],
-        ops=[("ramp", {"pp": (0, "r5")}), ("zero", ["pp"]), ("close",)])]),
+   dict(title="Stage 3", info="Ramp to rest, switch V1 to V2, ramp to P3",
+        fields=[_f("r3", "Ramp P2 to rest pressure", "r"), _f("P3", "P3: negative pressure", "p", "pp", "-", -100.0), _f("r4", "Ramp rest to P3", "r")],
+        ops=[("ramp", {"pp": ("Z_pp", "r3")}), ("zero", ["pp"]), ("open", [2]), ("ramp", {"pp": ("P3", "r4")})],
+        ops_direct=[("open", [2]), ("ramp", {"pp": ("P3", "r4")})], direct_skip=["r3"],
+        info_direct="Switch V1 to V2, ramp to P3"),
+   dict(title="Stage 4", info="Ramp to rest, close all valves, return to 0",
+        fields=[_f("r5", "Ramp P3 to rest pressure (and rest to 0)", "r")],
+        ops=[("ramp", {"pp": ("Z_pp", "r5")}), ("zero", ["pp"]), ("close",), ("unrest", {"pp": "r5"})])]),
  "t2": dict(title="Task 2: two pumps, four valves", roles=["pp", "ps"], valves=[1, 2, 3, 4],
   summary="The push-pull pump feeds V1 and V2 and the push pump feeds V3 and V4, each through an always-open three-way valve. Each stage holds until you press the next button.",
+  common=[_f("Z_pp", "Rest pressure, push-pull", "p", "pp", "*", 0.0), _f("Z_ps", "Rest pressure, push", "p", "ps", "*", 0.0)],
   stages=[
-   dict(title="Stage 1", info="Open V2 and V4, ramp to P1 and P2",
-        fields=[_f("P1", "P1: push-pull, positive", "p", "pp", "+", 100.0), _f("r1", "Push-pull ramp 0 to P1", "r"),
-                _f("P2", "P2: push, positive", "p", "ps", "+", 100.0), _f("r2", "Push ramp 0 to P2", "r")],
-        ops=[("open", [2, 4]), ("ramp", {"pp": ("P1", "r1"), "ps": ("P2", "r2")})]),
+   dict(title="Stage 1", info="Go to rest, open V2 and V4, ramp to P1 and P2",
+        fields=[_f("P1", "P1: push-pull, positive", "p", "pp", "+", 100.0), _f("r1", "Push-pull ramp rest to P1", "r"),
+                _f("P2", "P2: push, positive", "p", "ps", "+", 100.0), _f("r2", "Push ramp rest to P2", "r")],
+        ops=[("prerest", {"pp": "r1", "ps": "r2"}), ("open", [2, 4]), ("ramp", {"pp": ("P1", "r1"), "ps": ("P2", "r2")})]),
    dict(title="Stage 2", info="Ramp to P3 and P4",
         fields=[_f("P3", "P3: push-pull, negative", "p", "pp", "-", -100.0), _f("r3", "Push-pull ramp P1 to P3", "r"),
                 _f("P4", "P4: push, positive", "p", "ps", "+", 100.0), _f("r4", "Push ramp P2 to P4", "r")],
         ops=[("ramp", {"pp": ("P3", "r3"), "ps": ("P4", "r4")})]),
-   dict(title="Stage 3", info="Ramp to 0, switch to V1 and V3, ramp to P5 and P6",
-        fields=[_f("r5", "Push-pull ramp P3 to 0", "r"), _f("r6", "Push ramp P4 to 0", "r"),
-                _f("P5", "P5: push-pull, negative", "p", "pp", "-", -100.0), _f("r7", "Push-pull ramp 0 to P5", "r"),
-                _f("P6", "P6: push, positive", "p", "ps", "+", 100.0), _f("r8", "Push ramp 0 to P6", "r")],
-        ops=[("ramp", {"pp": (0, "r5"), "ps": (0, "r6")}), ("zero", ["pp", "ps"]), ("open", [1, 3]),
-             ("ramp", {"pp": ("P5", "r7"), "ps": ("P6", "r8")})]),
-   dict(title="Stage 4", info="Ramp to 0, close all valves",
-        fields=[_f("r9", "Push-pull ramp P5 to 0", "r"), _f("r10", "Push ramp P6 to 0", "r")],
-        ops=[("ramp", {"pp": (0, "r9"), "ps": (0, "r10")}), ("zero", ["pp", "ps"]), ("close",)])]),
+   dict(title="Stage 3", info="Ramp to rest, switch to V1 and V3, ramp to P5 and P6",
+        fields=[_f("r5", "Push-pull ramp P3 to rest pressure", "r"), _f("r6", "Push ramp P4 to rest pressure", "r"),
+                _f("P5", "P5: push-pull, negative", "p", "pp", "-", -100.0), _f("r7", "Push-pull ramp rest to P5", "r"),
+                _f("P6", "P6: push, positive", "p", "ps", "+", 100.0), _f("r8", "Push ramp rest to P6", "r")],
+        ops=[("ramp", {"pp": ("Z_pp", "r5"), "ps": ("Z_ps", "r6")}), ("zero", ["pp", "ps"]), ("open", [1, 3]),
+             ("ramp", {"pp": ("P5", "r7"), "ps": ("P6", "r8")})],
+        ops_direct=[("open", [1, 3]), ("ramp", {"pp": ("P5", "r7"), "ps": ("P6", "r8")})], direct_skip=["r5", "r6"],
+        info_direct="Switch to V1 and V3, ramp to P5 and P6"),
+   dict(title="Stage 4", info="Ramp to rest, close all valves, return to 0",
+        fields=[_f("r9", "Push-pull ramp P5 to rest pressure (and rest to 0)", "r"), _f("r10", "Push ramp P6 to rest pressure (and rest to 0)", "r")],
+        ops=[("ramp", {"pp": ("Z_pp", "r9"), "ps": ("Z_ps", "r10")}), ("zero", ["pp", "ps"]), ("close",),
+             ("unrest", {"pp": "r9", "ps": "r10"})])]),
 }
 
 
 def tasks_public():
-    return {k: dict(title=t["title"], summary=t["summary"], roles=t["roles"], valves=t["valves"], role_names=ROLE_NAMES,
-                    stages=[dict(title=g["title"], info=g["info"], fields=g["fields"]) for g in t["stages"]])
+    return {k: dict(title=t["title"], summary=t["summary"], roles=t["roles"], valves=t["valves"], role_names=ROLE_NAMES, common=t["common"],
+                    stages=[dict(title=g["title"], info=g["info"], fields=g["fields"], info_direct=g.get("info_direct"),
+                             direct_skip=g.get("direct_skip", [])) for g in t["stages"]])
             for k, t in TASKS.items()}
 
 
@@ -205,10 +216,11 @@ class Controller:
         self.w.writerow(self.header())
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.proc = dict(task=None, running=False, stage=0, busy=False, aborting=False, done=False, error=None, msg="",
-                         pumps=[], roles={}, base={}, tol=2.0)
+                         pumps=[], roles={}, base={}, tol=2.0, dwell=ZERO_CONFIRM_S)
         self.events, self.pstop, self.pabort, self.plock = [], threading.Event(), threading.Event(), threading.Lock()
         self.evpath = os.path.join("pump_logs", "events_" + os.path.basename(self.path)[5:])
         with open(self.evpath, "w", newline="") as f: f.write("time,event\n")
+        self.event("Program version %s" % VERSION)
 
     def header(self):
         h = ["time_s", "clock"]
@@ -292,14 +304,18 @@ class Controller:
             if len(set(roles.values())) < len(roles) or not all(0 <= i < self.n for i in roles.values()):
                 return False, "Choose a different, existing pump for each role."
         try:
-            vals = {f["key"]: float(d["vals"][f["key"]]) for g in task["stages"] for f in g["fields"]}
+            vals = {f["key"]: float(d["vals"][f["key"]]) for f in task["common"] + [f for g in task["stages"] for f in g["fields"]]}
             tol, rabort = float(d["tol"]), float(d["rabort"])
         except (KeyError, TypeError, ValueError): return False, "Enter numbers in every field."
         if not all(map(math.isfinite, [*vals.values(), tol, rabort])): return False, "Enter numbers in every field."
         if not 0 < tol <= 10: return False, "Zero tolerance must be above 0 and at most 10 mbar."
+        try: dwell = float(d.get("dwell", ZERO_CONFIRM_S))          # seconds the rest pressure must be held before valves switch
+        except (TypeError, ValueError): return False, "Enter numbers in every field."
+        if not 0 <= dwell <= 600: return False, "Time held at rest pressure must be between 0 and 600 s."
         if rabort <= 0: return False, "Abort ramp rate must be above 0."
-        for g in task["stages"]:
-            for f in g["fields"]:
+        direct = bool(d.get("direct"))                      # switch valves without ramping to zero
+        for g, f in [({}, f) for f in task["common"]] + [(g, f) for g in task["stages"] for f in g["fields"]]:
+                if direct and f["key"] in g.get("direct_skip", ()): continue
                 v = vals[f["key"]]
                 if f["kind"] == "r":
                     if v <= 0: return False, "%s must be above 0." % f["label"]
@@ -307,6 +323,7 @@ class Controller:
                 rng = self.ps[roles[f["role"]]].rng
                 lo, hi = max(rng[0], VALVE_MIN_MBAR), min(rng[1], VALVE_MAX_MBAR, self.max)
                 if f["sign"] == "+" and not 0 < v <= hi: return False, "%s must be above 0 and at most %g mbar." % (f["label"], hi)
+                if f["sign"] == "*" and not lo <= v <= hi: return False, "%s must be between %g and %g mbar." % (f["label"], lo, hi)
                 if f["sign"] == "-":
                     if lo >= 0: return False, "Pump %d cannot do negative pressure (%s)." % (roles[f["role"]] + 1, f["label"])
                     if not lo <= v < 0: return False, "%s must be between %g and 0 mbar." % (f["label"], lo)
@@ -318,11 +335,11 @@ class Controller:
                 for i in roles.values():
                     if self.ps[i].target != 0 or self.ps[i].sp != 0: return False, "Pump %d must be at 0 mbar to start." % (i + 1)
                 self.proc = dict(task=tk, running=True, stage=0, busy=True, aborting=False, done=False, error=None,
-                                 msg="Starting", pumps=list(roles.values()), roles=roles, base={}, tol=tol)
+                                 msg="Starting", pumps=list(roles.values()), roles=roles, base={}, tol=tol, dwell=dwell)
                 self.pstop.clear(); self.pabort.clear()
             elif not pr["running"] or pr["stage"] != k - 1: return False, "Finish the previous stage first."
-            else: pr.update(busy=True, tol=tol)
-        threading.Thread(target=self._stage, args=(task, k, roles, vals, tol, rabort), daemon=True).start()
+            else: pr.update(busy=True, tol=tol, dwell=dwell)
+        threading.Thread(target=self._stage, args=(task, k, roles, vals, tol, rabort, direct), daemon=True).start()
         return True, ""
 
     def abort_start(self, d):
@@ -366,7 +383,7 @@ class Controller:
             self.proc["base"][r] = b
             self.event("Zero reference, pump %d: %.1f mbar" % (roles[r] + 1, b))
 
-    def _ramp(self, goals, roles):
+    def _ramp(self, goals, roles, skip=()):
         pr = self.proc
         pr["msg"] = "Ramping: " + "; ".join("pump %d to %g mbar at %g mbar/s" % (roles[r] + 1, tg, rate) for r, (tg, rate) in goals.items())
         if not pr["aborting"]: self.event(pr["msg"])
@@ -375,23 +392,25 @@ class Controller:
                 q = self.ps[roles[r]]; q.up = q.dn = rate; q.target, q.cycle, q.hold_until = tg, False, None
         self._wait(lambda: all(self.ps[roles[r]].sp == tg for r, (tg, _) in goals.items()))
         for r, (tg, _) in goals.items():
-            if tg == 0: continue                            # zero is confirmed by a separate "zero" step
+            if r in skip: continue                          # rest-pressure ramps are confirmed by a separate "zero" step
             q, b = self.ps[roles[r]], pr["base"].get(r, 0.0)
             if not self._wait(lambda: abs(q.meas - b - tg) <= max(2.0, 0.03 * abs(tg)), SETTLE_TIMEOUT_S):
                 raise RuntimeError("Pump %d did not reach %g mbar (reads %.1f, zero reference %.1f)" % (roles[r] + 1, tg, q.meas, b))
 
-    def _zero(self, rs, roles, tol):
+    def _zero(self, rs, roles, tol, rest=None):
         pr = self.proc
-        pr["msg"] = "Waiting for zero pressure (within %g mbar of the idle reading for %g s)" % (tol, ZERO_CONFIRM_S)
+        rest = rest or {}
+        dwell = pr.get("dwell", ZERO_CONFIRM_S)
+        pr["msg"] = "Waiting for rest pressure (within %g mbar for %g s)" % (tol, dwell)
         since = {}
         def ok():
             now, good = time.time(), True
             for r in rs:
-                if abs(self.ps[roles[r]].meas - pr["base"].get(r, 0.0)) <= tol: since.setdefault(r, now)
+                if abs(self.ps[roles[r]].meas - pr["base"].get(r, 0.0) - rest.get(r, 0.0)) <= tol: since.setdefault(r, now)
                 else: since.pop(r, None); good = False
-            return good and all(now - since[r] >= ZERO_CONFIRM_S for r in rs)
-        if not self._wait(ok, ZERO_TIMEOUT_S):
-            raise RuntimeError("Zero not confirmed within %d s (pump %s)" % (ZERO_TIMEOUT_S, ", ".join(str(roles[r] + 1) for r in rs)))
+            return good and all(now - since[r] >= dwell for r in rs)
+        if not self._wait(ok, ZERO_TIMEOUT_S + dwell):
+            raise RuntimeError("Rest pressure not confirmed within %d s (pump %s)" % (ZERO_TIMEOUT_S + dwell, ", ".join(str(roles[r] + 1) for r in rs)))
 
     def _op(self, op, roles, vals, tol):
         pr = self.proc
@@ -404,16 +423,29 @@ class Controller:
         elif op[0] == "close":
             self.box.close_all(); self.event("All valves closed")
         elif op[0] == "ramp":
-            self._ramp({r: (vals[t] if isinstance(t, str) else float(t), vals[rk]) for r, (t, rk) in op[1].items()}, roles)
+            goals = {r: (vals[t] if isinstance(t, str) else float(t), vals[rk]) for r, (t, rk) in op[1].items()}
+            self._ramp(goals, roles, {r for r, (t, _) in op[1].items() if isinstance(t, str) and t.startswith("Z_")})
         elif op[0] == "zero":
-            self._zero(op[1], roles, tol)
+            self._zero(op[1], roles, tol, pr.get("rest"))
+        elif op[0] == "prerest":      # before the first stage: bring each pump to its rest pressure (skipped when it is 0)
+            goals = {r: (vals["Z_" + r], vals[rk]) for r, rk in op[1].items() if abs(vals["Z_" + r]) > 1e-9}
+            if goals:
+                self._ramp(goals, roles, set(goals)); self._zero(list(goals), roles, tol, pr.get("rest"))
+        elif op[0] == "unrest":       # after the valves are closed: return each pump to 0
+            goals = {r: (0.0, vals[rk]) for r, rk in op[1].items() if abs(vals["Z_" + r]) > 1e-9}
+            if goals: self._ramp(goals, roles, set(goals))
 
-    def _stage(self, task, k, roles, vals, tol, rabort):
+    def _stage(self, task, k, roles, vals, tol, rabort, direct=False):
         pr, g = self.proc, task["stages"][k - 1]
+        pr["rest"] = {r: vals["Z_" + r] for r in roles}          # the pressure that replaces "zero" in this stage
         try:
             if k == 1: self._baseline(roles, tol)
-            self.event("%s: %s | %s" % (g["title"], g["info"], ", ".join("%s=%g" % (f["key"], vals[f["key"]]) for f in g["fields"])))
-            for op in g["ops"]: self._op(op, roles, vals, tol)
+            self.event("%s: %s | %s | rest %s, tolerance %g mbar, held %g s" % (g["title"], g["info"],
+                       ", ".join("%s=%g" % (f["key"], vals[f["key"]]) for f in g["fields"]),
+                       ", ".join("%s=%g" % (r, vals["Z_" + r]) for r in roles), tol, pr["dwell"]))
+            ops = g["ops_direct"] if direct and "ops_direct" in g else g["ops"]
+            if ops is not g["ops"]: self.event("Direct valve switch: no ramp to zero, valves switch at the current pressure")
+            for op in ops: self._op(op, roles, vals, tol)
             if k == 4:
                 self.event("Process complete")
                 pr.update(stage=4, running=False, busy=False, done=True, msg="Process complete. All valves closed.")
@@ -427,11 +459,14 @@ class Controller:
         pr = self.proc
         try:
             pr.update(busy=True, aborting=True, msg="Aborting: ramping to 0, then closing all valves")
-            self.event("ABORT: all pumps to 0 at %g mbar/s, then close valves" % rabort)
-            self._ramp({r: (0.0, rabort) for r in roles}, roles)
-            self._zero(list(roles), roles, tol)
-            self.box.close_all(); self.event("Aborted: pressure at 0, all valves closed")
-            pr.update(running=False, busy=False, aborting=False, msg="Aborted. Pressure ramped to 0 and valves closed.")
+            self.event("ABORT: all pumps to rest pressure at %g mbar/s, then close valves" % rabort)
+            rest = pr.get("rest", {})
+            self._ramp({r: (rest.get(r, 0.0), rabort) for r in roles}, roles, set(roles))
+            self._zero(list(roles), roles, tol, rest)
+            self.box.close_all(); self.event("Aborted: pressure at rest level, all valves closed")
+            if any(abs(v) > 1e-9 for v in rest.values()):
+                self._ramp({r: (0.0, rabort) for r in roles}, roles, set(roles))
+            pr.update(running=False, busy=False, aborting=False, msg="Aborted. Pressure ramped to the rest level and valves closed.")
         except Stopped: self._stopped()
         except Exception as e: self._fault(roles, e)
 
@@ -508,14 +543,14 @@ class Controller:
                 pts.append(r + vs)
             ps = [dict(state=p.state, sp=p.sp, meas=p.meas, target=p.target, rng=p.rng,
                        hold_left=None if p.hold_until is None else max(0, p.hold_until - now)) for p in self.ps]
-            return dict(n=n, pts=pts, pumps=ps, error=self.error, max=self.max,
+            return dict(n=n, start=self.t0, pts=pts, pumps=ps, error=self.error, max=self.max,
                         device=self.hw.device, file=self.path,
                         valves=dict(connected=self.box.connected, port=self.box.port, reply=self.box.reply,
                                     items=[dict(n=n, label=l, open=self.box.state[n]) for n, l in VALVES.items()]),
                         process=dict(self.proc, events=self.events[-30:]))
 
-    def csv_text(self):
-        with self.lock: rows = list(self.log)
+    def csv_text(self, lo=None, hi=None):          # lo/hi: seconds since the program started (None = no limit)
+        with self.lock: rows = [r for r in self.log if (lo is None or r[0] >= lo) and (hi is None or r[0] <= hi)]
         out = io.StringIO(); w = csv.writer(out)
         w.writerow(self.header())
         for t, sps, ms, vs in rows: w.writerow(self.row(t, self.t0 + t, sps, ms, vs))
@@ -562,8 +597,11 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/ports":
             self._send(200, self.ctrl.box.port_info())
         elif u.path == "/api/export.csv":
-            name = "pump_log_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
-            self._send(200, self.ctrl.csv_text(), "text/csv",
+            qs = parse_qs(u.query)
+            try: lo, hi = float(qs["from"][0]), float(qs["to"][0])
+            except (KeyError, IndexError, ValueError): lo = hi = None
+            name = "pump_log_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ("_selection" if lo is not None else "") + ".csv"
+            self._send(200, self.ctrl.csv_text(lo, hi), "text/csv",
                        {"Content-Disposition": 'attachment; filename="%s"' % name})
         else:
             self._send(404, {"error": "not found"})
@@ -609,7 +647,7 @@ def main():
     srv = Server(("127.0.0.1", a.port), Handler)
     url = "http://127.0.0.1:%d" % a.port
     print("Controlling %d pump(s) at %s  (Ctrl+C to stop; pressure returns to 0)" % (n, url))
-    print("Logging to", ctrl.path)
+    print("Logging to", ctrl.path, "(program version %s)" % VERSION)
     threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
@@ -632,7 +670,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 "Segoe UI",sy
 main{max-width:1200px;margin:0 auto;padding:18px;display:grid;gap:16px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}
 .top{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-canvas{width:100%;height:300px;display:block;margin-top:8px}
+canvas{width:100%;height:300px;display:block;margin-top:8px;cursor:crosshair;touch-action:pan-y}
 .legend{display:flex;gap:18px;flex-wrap:wrap;color:var(--mute);margin-top:6px}
 .legend i{display:inline-block;width:18px;height:0;border-top:3px solid;vertical-align:middle;margin-right:6px}
 #cards{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(255px,1fr))}
@@ -657,6 +695,7 @@ button.stop{background:var(--stopbg);color:var(--stop);border:2px solid var(--st
 button.all{width:auto;margin:0;padding:12px 22px;font-size:17px}
 button.valve{width:auto;min-width:230px;margin:0}button.valve.open{background:#2e7d32;border-color:#2e7d32;color:#fff}button.valve:disabled{opacity:.5;cursor:not-allowed}
 .tabs{display:flex;gap:8px}.tabs button{width:auto;margin:0;padding:9px 18px}
+.dbox{fill:var(--panel);stroke:var(--ink);stroke-width:1.5}.dt{fill:var(--ink);font:600 13px system-ui,sans-serif}.ds{fill:var(--mute);font:12px system-ui,sans-serif}.dusb{stroke:var(--mute);stroke-width:3;fill:none}.dair{stroke:#1565c0;stroke-width:3;fill:none}.dele{stroke:#c27400;stroke-width:2;stroke-dasharray:6 4;fill:none}.dv{fill:var(--panel);stroke:var(--ink);stroke-width:1.5}.dv.open{fill:#2e7d32}.dt.open,.ds.open{fill:#fff}
 .pill{padding:4px 12px;border-radius:99px;border:1px solid var(--line);font-weight:600;font-size:13px}.pill.open{background:#2e7d32;border-color:#2e7d32;color:#fff}
 .stagebar{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:14px 0 8px}.bigstage{margin:0;min-height:100px;font-size:20px}.bigstage small{display:block;font-weight:400;font-size:13px;margin-top:4px}.bigstage:disabled{opacity:.45;cursor:not-allowed}.stagegrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-top:12px}fieldset{border:1px solid var(--line);border-radius:8px;margin:0;padding:4px 12px 12px}legend{font-weight:700;padding:0 6px}
 button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--c0);outline-offset:1px}
@@ -668,13 +707,16 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid 
  <div class="top">
   <button class="stop all" onclick="send('all','stop')">STOP ALL: vent every pump to 0 and close valves</button>
   <select id="win" aria-label="Time window"><option value="30">Last 30 s</option><option value="120">Last 2 min</option><option value="600">Last 10 min</option><option value="0">Whole run</option></select>
-  <button class="small alt" onclick="location.href='/api/export.csv'">Download CSV</button>
+  <select id="exp" aria-label="What to export"><option value="all">Export: whole run</option><option value="view">Export: what the graph shows</option><option value="sel" disabled>Export: selected range</option></select>
+  <button class="small alt" onclick="exportCsv()">Download CSV</button>
+  <button class="small alt" id="clrsel" onclick="clearSel()" disabled>Clear selection</button>
+  <span class="note" id="selinfo" style="margin:0">Tip: drag on the graph to select a time range to export.</span>
   <span class="msg" id="gmsg"></span>
  </div>
  <div class="top" id="vstrip" style="margin-top:8px"><span class="note" style="margin:0">Valves (as commanded):</span></div>
  <canvas id="chart"></canvas>
  <div class="legend" id="legend"></div>
- <div class="note">Solid line is measured pressure, dashed line is the setpoint. Green bars under the graph show when each valve is open (as commanded; the box does not report back). Esc stops all pumps.</div>
+ <div class="note">Solid line is measured pressure, dashed line is the setpoint. Green bars under the graph show when each valve is open (as commanded; the box does not report back). Drag on the graph to select a range, then choose Export: selected range. Esc stops all pumps.</div>
  <div class="note" id="info"></div>
 </section>
 <div class="tabs" id="tabs"><button id="tab_manual" onclick="tab('manual')">Manual control</button></div>
@@ -749,6 +791,26 @@ async function setValve(n,open){
   const d=await r.json();$('vmsg').textContent=d.ok?'':d.error;}
  catch(e){$('vmsg').textContent='Lost connection to the program.';}
 }
+let sel=null,drag=null,view=null;     // selection in seconds since the program started
+function exportCsv(){
+ const m=$('exp').value,w=+$('win').value;let q='';
+ if(m==='sel'&&sel)q='?from='+sel[0].toFixed(2)+'&to='+sel[1].toFixed(2);
+ else if(m==='view'&&pts.length&&w>0){const e=pts[pts.length-1][0];q='?from='+(e-w).toFixed(2)+'&to='+e.toFixed(2);}
+ location.href='/api/export.csv'+q;
+}
+function clk(t){return new Date((st.start+t)*1000).toLocaleTimeString();}
+function updSel(){
+ $('exp').querySelector('option[value=sel]').disabled=!sel;$('clrsel').disabled=!sel;
+ if(!sel){if($('exp').value==='sel')$('exp').value='all';$('selinfo').textContent='Tip: drag on the graph to select a time range to export.';}
+ else $('selinfo').textContent='Selected '+clk(sel[0])+' to '+clk(sel[1])+' ('+(sel[1]-sel[0]).toFixed(1)+' s)';
+}
+function clearSel(){sel=null;drag=null;updSel();draw();}
+function tAt(ev){const r=$('chart').getBoundingClientRect();
+ const t=view.tStart+Math.min(1,Math.max(0,(ev.clientX-r.left-view.L)/view.pw))*view.span;
+ return Math.min(pts[pts.length-1][0],Math.max(pts[0][0],t));}   // stay inside the recorded data
+$('chart').addEventListener('pointerdown',ev=>{if(!view||!st)return;ev.preventDefault();$('chart').setPointerCapture(ev.pointerId);drag=tAt(ev);sel=[drag,drag];});
+$('chart').addEventListener('pointermove',ev=>{if(drag===null)return;const t=tAt(ev);sel=[Math.min(drag,t),Math.max(drag,t)];updSel();draw();});
+$('chart').addEventListener('pointerup',()=>{if(drag===null)return;drag=null;if(sel&&sel[1]-sel[0]<0.3)sel=null;updSel();draw();});
 function setText(el,t){if(el.textContent!==t)el.textContent=t;}
 function setHTML(el,h){if(el._h!==h){el.innerHTML=h;el._h=h;}}
 let tasks=null;
@@ -760,9 +822,10 @@ async function pcmd(body){
 }
 async function stageClick(tk,k){
  const t=tasks[tk],vals={},roles={};
+ (t.common||[]).forEach(f=>vals[f.key]=$(tk+'_'+f.key).value);
  t.stages.forEach(g=>g.fields.forEach(f=>vals[f.key]=$(tk+'_'+f.key).value));
  t.roles.forEach(r=>roles[r]=+$(tk+'_role_'+r).value);
- const d=await pcmd({action:'stage',task:tk,stage:k,roles,vals,tol:$(tk+'_tol').value,rabort:$(tk+'_rabort').value});
+ const d=await pcmd({action:'stage',task:tk,stage:k,roles,vals,tol:$(tk+'_tol').value,rabort:$(tk+'_rabort').value,dwell:$(tk+'_dwell').value,direct:!!($(tk+'_direct')&&$(tk+'_direct').checked)});
  $(tk+'_msg').textContent=d.ok?'':d.error;
 }
 async function abortClick(tk){const d=await pcmd({action:'abort',rabort:$(tk+'_rabort').value});$(tk+'_msg').textContent=d.ok?'':d.error;}
@@ -773,6 +836,8 @@ async function loadTasks(){
   const b=document.createElement('button');b.id='tab_'+tk;b.className='alt';b.textContent=t.title.split(':')[0];b.onclick=()=>tab(tk);$('tabs').appendChild(b);
   const s=document.createElement('section');s.className='panel';s.id='task_'+tk;s.style.display='none';
   s.innerHTML=`<h2>${t.title}</h2><div class="note">${t.summary}</div>
+   <details open><summary style="cursor:pointer;font-weight:600;margin:8px 0">Setup diagram</summary>${diagram(tk,t)}
+    <div class="note">Grey: USB. Blue: pressure and fluid lines. Dashed orange: valve control wiring from the valve box. Valves turn green when open (as commanded).</div></details>
    <div class="grid2">${t.roles.map(r=>`<label>${t.role_names[r]}<select id="${tk}_role_${r}" style="width:100%"></select></label>`).join('')}</div>
    <div class="stagebar">${t.stages.map((g,i)=>`<button class="bigstage" id="${tk}_b${i+1}" onclick="stageClick('${tk}',${i+1})"></button>`).join('')}</div>
    <div id="${tk}_status" style="font-weight:600"></div><div class="note" id="${tk}_live"></div>
@@ -781,13 +846,46 @@ async function loadTasks(){
    <h2 style="margin-top:18px">Settings</h2>
    <div class="top"><label style="margin:0">All ramp rates <span>mbar/s</span> <input id="${tk}_uni" type="number" min="0" step="any" value="10" style="width:110px"></label>
     <button class="small" onclick="applyUni('${tk}')">Apply to every ramp</button><span class="note">Each ramp rate can still be changed on its own afterwards.</span></div>
+   ${t.stages.some(g=>g.info_direct)?`<label style="display:block;margin:10px 0"><input type="checkbox" id="${tk}_direct" style="width:auto;margin-right:8px">Switch valves without ramping to zero (skips the ramp to 0 and the zero check; the new valve opens at the current pressure)</label>`:''}
+   <fieldset style="margin-top:12px"><legend>Rest pressure (the "zero")</legend>
+    <div class="note" style="margin:0 0 6px">The pressure each pump returns to instead of exactly 0, for example to match the animal. It is used before Stage 1, when switching valves and at the end. Leave it at 0 for true zero. Valves only switch after the pressure has been held there for the time below.</div>
+    <div class="grid2">${(t.common||[]).map(f=>`<label>${f.label} <span>mbar</span><input id="${tk}_${f.key}" type="number" step="any" value="${f.default}"></label>`).join('')}<label>Time held at rest pressure <span>s</span><input id="${tk}_dwell" type="number" min="0" step="any" value="2"></label></div></fieldset>
    <div class="stagegrid">${t.stages.map(g=>`<fieldset><legend>${g.title}: ${g.info}</legend><div class="grid2">${g.fields.map(f=>`<label>${f.label} <span>${f.kind==='r'?'mbar/s':'mbar'}</span><input class="${tk}_${f.kind}" id="${tk}_${f.key}" type="number" step="any" value="${f.default}"></label>`).join('')}</div></fieldset>`).join('')}</div>
-   <div class="grid2"><label>Zero tolerance <span>mbar</span><input id="${tk}_tol" type="number" min="0" step="any" value="2"></label>
+   <div class="grid2"><label>Rest-pressure tolerance <span>mbar</span><input id="${tk}_tol" type="number" min="0" step="any" value="2"></label>
     <label>Abort ramp rate <span>mbar/s</span><input id="${tk}_rabort" type="number" min="0" step="any" value="50"></label></div>
    <div class="note" id="${tk}_ev" style="white-space:pre-line"></div>
-   <div class="note">Settings are read when each stage starts, so you can change the next stage's values while a stage is holding. Pumps must be at 0 mbar to start. Zero is each pump's idle reading when Stage 1 starts. Valves only switch after pressure has stayed within the zero tolerance of that reading for 2 s. STOP ALL or Esc ends the process at once.</div>`;
+   <div class="note">Settings are read when each stage starts, so you can change the next stage's values while a stage is holding. Pumps must be at 0 mbar to start. Readings are corrected by each pump's idle reading when Stage 1 starts. Valves only switch after pressure has stayed within the tolerance of the rest pressure for the time set above (2 s by default). STOP ALL or Esc ends the process at once.</div>`;
   $('tasks').appendChild(s);
  });
+}
+function diagram(tk,t){
+ const np=t.roles.length,H=np*150+110,cy=np*75,ay=H-90,bx=852;
+ const L=(c,p)=>`<polyline class="${c}" points="${p}"/>`;
+ const X=(x,y,s,c,a)=>`<text x="${x}" y="${y}" class="${c}" text-anchor="${a||'middle'}">${s}</text>`;
+ const B=(x,y,w,h,a,b,id)=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="8" class="dbox"/>`+X(x+w/2,y+h/2-(b?3:-5),a,'dt')+(b?`<text x="${x+w/2}" y="${y+h/2+14}" class="ds" text-anchor="middle" id="${id||''}">${b}</text>`:'');
+ let o=`<svg viewBox="0 0 880 ${H}" style="width:100%;max-width:900px;height:auto" role="img" aria-label="Setup diagram">`;
+ o+=B(20,cy-35,130,70,'Computer','this web page')+B(195,cy-28,120,56,'Fluigent LINK','USB module')+L('dusb',`150,${cy} 195,${cy}`)+X(172,cy-8,'USB','ds');
+ o+=B(640,ay,190,70,'Valve box','Arduino + regulators')+L('dusb',`85,${cy+35} 85,${ay+35} 640,${ay+35}`)+X(360,ay+28,'USB (serial)','ds');
+ o+=L('dele',`830,${ay+35} ${bx},${ay+35} ${bx},7`);
+ t.roles.forEach((r,i)=>{const ry=i*150,py=ry+77;
+  o+=B(350,ry+37,150,80,t.role_names[r],'Pump',tk+'_dp'+i)+L('dusb',`315,${cy} 335,${cy} 335,${py} 350,${py}`);
+  o+=L('dair',`500,${py} 533,${py}`)+`<circle cx="545" cy="${py}" r="12" class="dbox"/>`+L('dair',`557,${py} 590,${py}`)+X(545,py+30,'3-way valve','ds')+X(545,py+43,'(always open)','ds');
+  o+=L('dair',`590,${ry+42} 590,${ry+112}`);
+  [0,1].forEach(j=>{const n=t.valves[2*i+j],vy=ry+20+j*70;
+   o+=L('dair',`590,${vy+22} 620,${vy+22}`)+`<rect x="620" y="${vy}" width="80" height="44" rx="6" class="dv" id="${tk}_dv${n}"/>`;
+   o+=`<text x="660" y="${vy+19}" class="dt" text-anchor="middle" id="${tk}_dl${n}">V${n}</text><text x="660" y="${vy+35}" class="ds" text-anchor="middle" id="${tk}_ds${n}">-</text>`;
+   o+=L('dair',`700,${vy+22} 790,${vy+22}`)+`<text x="745" y="${vy+16}" class="ds" text-anchor="middle" id="${tk}_do${n}"></text>`;
+   o+=L('dele',`${bx},${vy-13} 660,${vy-13} 660,${vy}`);});
+ });
+ return o+'</svg>';
+}
+function updDiagram(tk,t){
+ t.roles.forEach((r,i)=>{const idx=+$(tk+'_role_'+r).value,q=st.pumps[idx];
+  setText($(tk+'_dp'+i),q?'Pump '+(idx+1)+': '+q.meas.toFixed(1)+' mbar':'no pump');});
+ t.valves.forEach(n=>{const it=st.valves.items.find(x=>x.n===n),on=!!(it&&it.open);
+  ['dv','dl','ds'].forEach(k=>$(tk+'_'+k+n).classList.toggle('open',on));
+  setText($(tk+'_ds'+n),it?(it.open?'OPEN':'CLOSED'):'not installed');
+  setText($(tk+'_do'+n),it?it.label:'');});
 }
 function renderTasks(){
  if(!tasks)return;
@@ -801,7 +899,8 @@ function renderTasks(){
   t.stages.forEach((g,i)=>{const k=i+1,b=$(tk+'_b'+k);
    const done=mine&&(run||p.done)&&p.stage>=k,now=mine&&run&&p.busy&&p.stage===k-1&&!p.aborting;
    b.disabled=!(ready&&!p.busy&&((k===1&&!run)||(run&&mine&&p.stage===k-1)));
-   setHTML(b,(done?'\u2713 ':now?'\u25B6 ':'')+'<b>'+g.title+'</b><small>'+g.info+'</small>');});
+   (g.direct_skip||[]).forEach(kk=>{$(tk+'_'+kk).disabled=!!($(tk+'_direct')&&$(tk+'_direct').checked);});
+   setHTML(b,(done?'\u2713 ':now?'\u25B6 ':'')+'<b>'+g.title+'</b><small>'+(($(tk+'_direct')&&$(tk+'_direct').checked&&g.info_direct)||g.info)+'</small>');});
   $(tk+'_abort').disabled=!(run&&mine&&!p.aborting);
   let msg='';
   if(!have)msg='Needs valves '+t.valves.join(', ')+'; only valves '+st.valves.items.map(i=>i.n).join(', ')+' exist, so this is simulation only for now.';
@@ -810,6 +909,7 @@ function renderTasks(){
   else if(mine)msg=p.error||p.msg;
   const el=$(tk+'_status');el.textContent=msg;el.style.color=(mine&&p.error)?'var(--stop)':'';
   $(tk+'_live').textContent=(mine&&run)?t.roles.map(r=>{const q=st.pumps[p.roles[r]];return t.role_names[r]+' (pump '+(p.roles[r]+1)+'): '+q.meas.toFixed(1)+' mbar, setpoint '+q.sp.toFixed(1)}).join('  |  '):'';
+  updDiagram(tk,t);
   $(tk+'_ev').textContent=p.events.slice(-10).map(e=>e[0]+'  '+e[1]).join('\n');
  });
 }
@@ -864,6 +964,7 @@ function draw(){
  for(let i=i0;i<pts.length;i++)for(let j=1;j<=2*k;j++){ymax=Math.max(ymax,pts[i][j]);ymin=Math.min(ymin,pts[i][j]);}
  const step=nice((ymax-ymin)*1.05/4);ymax=Math.ceil(ymax*1.05/step)*step;ymin=Math.floor(ymin*1.05/step)*step;
  const X=t=>L+(t-tStart)/span*pw,Y=v=>T+ph-(v-ymin)/(ymax-ymin)*ph;
+ view={L,pw,tStart,span};
  g.font='12px "Segoe UI",system-ui,sans-serif';g.fillStyle=col('--mute');g.strokeStyle=col('--line');g.lineWidth=1;
  g.textAlign='right';g.textBaseline='middle';
  for(let v=ymin;v<=ymax+1e-9;v+=step){g.beginPath();g.moveTo(L,Y(v));g.lineTo(w-R,Y(v));g.stroke();g.fillText(String(+v.toFixed(2)),L-6,Y(v));}
@@ -874,6 +975,8 @@ function draw(){
   for(let i=i0;i<pts.length;i+=every){const x=X(pts[i][0]),y=Y(pts[i][idx]);i===i0?g.moveTo(x,y):g.lineTo(x,y);}
   g.stroke();g.setLineDash([]);};
  for(let p=0;p<k;p++){line(1+2*p,col('--c'+p),[6,4]);line(2+2*p,col('--c'+p),[]);}
+ if(sel){const a=Math.max(L,X(sel[0])),b=Math.min(L+pw,X(sel[1]));
+  if(b>a){g.fillStyle='rgba(21,101,192,0.15)';g.fillRect(a,T,b-a,ph+SV);g.strokeStyle='#1565c0';g.lineWidth=1;g.strokeRect(a,T,b-a,ph+SV);}}
  st.valves.items.forEach((it,j)=>{
   const y=T+ph+6+j*11,bi=1+2*k+j;
   g.fillStyle=col('--mute');g.textAlign='right';g.textBaseline='middle';g.fillText('V'+it.n,L-6,y+4.5);
